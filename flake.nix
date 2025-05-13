@@ -8,9 +8,9 @@
       let pkgs = import nixpkgs { inherit system; };
       in {
         devShell = pkgs.mkShell {
-          buildInputs = with pkgs; [ neofetch llvm ];
+          buildInputs = with pkgs; [ rustup cargo neofetch llvm ];
           shellHook = ''
-              exec $SHELL -l
+              exec zsh -l
           '';
         };
       });

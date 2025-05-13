@@ -1,417 +1,380 @@
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
-};
-use std::{
-    error::Error,
-    io,
-    time::{Duration, Instant},
-};
+use std::collections::{HashMap, VecDeque};
+use std::ops::Index;
+use std::range::Range;
 
-pub const BRAINFUCK_TO_INSTRUCTION_RATIO: usize = 4;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Instruction {
-    Add(u8) = b'+',
-    Sub(u8) = b'-',
-    MoveRight(u8) = b'>',
-    MoveLeft(u8) = b'<',
-    Output = b'.',
-    Input = b',',
-    Jump(u32) = b'[',
-    JumpBack(u32) = b']',
-
-    #[cfg(feature = "debug")]
-    Debug = b'?',
-}
-
-#[cfg(not(feature = "debug"))]
-pub type Inst = Instruction;
-
-#[cfg(feature = "debug")]
-pub type Inst = (Instruction, usize);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Interpreter {
-    pub memory: Vec<u8>,
-    pub position: usize,
+#[derive(Debug, Clone, PartialEq)]
+pub struct Interpreter<'a> {
+    pub bf: &'a [u8],
     pub pc: usize,
-    pub instructions: Box<[Inst]>,
-    pub input: Vec<u8>,
+    pub cache: HashMap<usize, usize>,
+
+    pub tape: Vec<u8>,
+    pub location: usize,
+
+    pub input: VecDeque<u8>,
+
+    pub history: Vec<Delta>,
+    pub keep_history: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub enum Delta {
+    Add(u8),
+    Sub(u8),
+    Move(isize),
+    Jump(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Output {
-    Output(u8),
-    Input,
+    RequiresInput,
     End,
+    UnallowedCharacter(usize),
+    TriedToMoveOutOfBounds,
 }
 
-impl Instruction {
-    pub fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            b'+' => Some(Instruction::Add(1)),
-            b'-' => Some(Instruction::Sub(1)),
-            b'>' => Some(Instruction::MoveRight(1)),
-            b'<' => Some(Instruction::MoveLeft(1)),
-            b'.' => Some(Instruction::Output),
-            b',' => Some(Instruction::Input),
-            b'[' => Some(Instruction::Jump(0)),
-            b']' => Some(Instruction::JumpBack(0)),
-            #[cfg(feature = "debug")]
-            b'?' => Some(Instruction::Debug),
-            _ => None,
-        }
-    }
-
-    pub fn update_with(&mut self, byte: u8) -> bool {
-        match (self, byte) {
-            (Instruction::Add(n), b'+') => {
-                *n += 1;
-                true
-            }
-            (Instruction::Add(n), b'-') => {
-                *n = n.saturating_sub(1);
-                true
-            }
-            (Instruction::Sub(n), b'-') => {
-                *n += 1;
-                true
-            }
-            (Instruction::Sub(n), b'+') => {
-                *n = n.saturating_sub(1);
-                true
-            }
-            (Instruction::MoveRight(n), b'>') => {
-                *n += 1;
-                true
-            }
-            (Instruction::MoveRight(n), b'<') => {
-                *n = n.saturating_sub(1);
-                true
-            }
-            (Instruction::MoveLeft(n), b'<') => {
-                *n += 1;
-                true
-            }
-            (Instruction::MoveLeft(n), b'>') => {
-                *n = n.saturating_sub(1);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    pub fn parse(str: &[u8]) -> Result<(usize, Self), &'static str> {
-        let byte = str.get(0).ok_or("expected byte found EOF")?;
-        let mut instruction = Self::from_byte(*byte).ok_or("unexpected char")?;
-        let mut count = 1;
-        while let Some(&nex_byte) = str.get(count)
-            && instruction.update_with(nex_byte)
-        {
-            count += 1;
-        }
-        Ok((count, instruction))
-    }
-
-    #[cfg(not(feature = "debug"))]
-    pub fn update_jumps(instructions: &mut [Instruction]) -> Result<(), &'static str> {
-        let mut stack = Vec::new();
-        for i in 0..instructions.len() {
-            match instructions[i] {
-                Instruction::Jump(_) => stack.push(i),
-                Instruction::JumpBack(_) => {
-                    if let Some(start) = stack.pop() {
-                        instructions[start] = Instruction::Jump(i as u32);
-                        instructions[i] = Instruction::JumpBack(start as u32);
-                    } else {
-                        return Err("unmatched ']' found");
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !stack.is_empty() {
-            return Err("unmatched '[' found");
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "debug")]
-    pub fn update_jumps(
-        instructions: &mut [(Instruction, usize)],
-    ) -> Result<(), (&'static str, usize)> {
-        let mut stack = Vec::new();
-        for i in 0..instructions.len() {
-            match instructions[i].0 {
-                Instruction::Jump(_) => stack.push(i),
-                Instruction::JumpBack(_) => {
-                    if let Some(start) = stack.pop() {
-                        instructions[start].0 = Instruction::Jump(i as u32);
-                        instructions[i].0 = Instruction::JumpBack(start as u32);
-                    } else {
-                        return Err(("unmatched ']' found", i));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !stack.is_empty() {
-            return Err(("unmatched '[' found", 0));
-        }
-        Ok(())
-    }
-
-    pub fn execute(&self, inter: &mut Interpreter) -> Option<Output> {
-        match self {
-            Instruction::Add(n) => {
-                inter.memory[inter.position] = inter.memory[inter.position].saturating_add(*n)
-            }
-            Instruction::Sub(n) => {
-                inter.memory[inter.position] = inter.memory[inter.position].saturating_sub(*n)
-            }
-            Instruction::MoveRight(n) => {
-                inter.position = inter.position.saturating_add(*n as usize);
-            }
-            Instruction::MoveLeft(n) => {
-                inter.position = inter.position.saturating_sub(*n as usize);
-            }
-            Instruction::Output => {
-                return Some(Output::Output(inter.memory[inter.position]));
-            }
-            Instruction::Input => {
-                if let Some(input) = inter.input.pop() {
-                    inter.memory[inter.position] = input;
-                } else {
-                    inter.pc -= 1;
-                    return Some(Output::Input);
-                }
-            }
-            Instruction::Jump(start) => {
-                if inter.memory[inter.position] == 0 {
-                    inter.pc = *start as usize;
-                }
-            }
-            Instruction::JumpBack(start) => {
-                if inter.memory[inter.position] != 0 {
-                    inter.pc = *start as usize;
-                }
-            }
-            #[cfg(feature = "debug")]
-            Instruction::Debug => {
-                return inter.debug();
-            }
-        }
-        None
-    }
-}
-
-impl Interpreter {
-    pub fn new() -> Self {
+impl<'a> Interpreter<'a> {
+    pub fn new(bf: &'a [u8]) -> Self {
         Self {
-            memory: vec![0; 30_000],
-            position: 0,
+            bf,
             pc: 0,
-            instructions: Vec::new().into_boxed_slice(),
-            input: Vec::new(),
+            cache: HashMap::new(),
+            tape: vec![0; 30_000],
+            location: 0,
+            input: VecDeque::new(),
+            history: Vec::new(),
+            keep_history: false,
         }
     }
 
-    pub fn with_str(mut self, bf: &[u8]) -> Result<Self, (&'static str, usize)> {
-        let len = bf.len() / BRAINFUCK_TO_INSTRUCTION_RATIO;
-        let mut instructions = Vec::with_capacity(len);
-        let mut index = 0;
-        while index < bf.len() {
-            let (count, instruction) = match Instruction::parse(&bf[index..]) {
-                Ok((count, instruction)) => (count, instruction),
-                Err(err) => return Err((err, index)),
-            };
-
-            #[cfg(not(feature = "debug"))]
-            instructions.push(instruction);
-
-            #[cfg(feature = "debug")]
-            instructions.push((instruction, index));
-
-            index += count;
-        }
-        #[cfg(not(feature = "debug"))]
-        Instruction::update_jumps(&mut instructions).map_err(|e| (e, 0))?;
-
-        #[cfg(feature = "debug")]
-        Instruction::update_jumps(&mut instructions)?;
-
-        self.instructions = instructions.into_boxed_slice();
-        Ok(self)
+    pub fn keep_history(&mut self) -> &mut Self {
+        self.keep_history = true;
+        self
     }
 
-    pub fn poll(&mut self) -> Output {
-        if self.pc >= self.instructions.len() {
-            return Output::End;
-        }
-        while let Some(instruction) = self.instructions.get(self.pc).map(Clone::clone) {
-            self.pc += 1;
-            #[cfg(not(feature = "debug"))]
-            match instruction.execute(self) {
-                Some(out) => return out,
-                None => continue,
-            }
-            #[cfg(feature = "debug")]
-            match instruction.0.execute(self) {
-                Some(out) => return out,
-                None => continue,
-            }
-        }
-        Output::End
+    pub fn stop_keeping_histroy(&mut self) -> &mut Self {
+        self.keep_history = false;
+        self.history.clear();
+        self
     }
 
-    pub fn input(&mut self, input: &[u8]) {
-        self.input.extend_from_slice(input);
+    pub fn run(&mut self) -> Result<u8, Output> {
+        while self.pc < self.bf.len() {
+            match self.tick() {
+                Ok(Some(byte)) => return Ok(byte),
+                Ok(None) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Output::End)
     }
 
-    pub fn debug(&mut self) -> Option<Output> {
-        let backend = CrosstermBackend::new(io::stdout());
-        let mut terminal = match Terminal::new(backend) {
-            Ok(terminal) => terminal,
-            Err(_) => return None,
-        };
-
-        let original_terminal_state = (
-            crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
-            crossterm::cursor::position().ok(),
-        );
-
-        if original_terminal_state.0 == false {
-            enable_raw_mode().ok()?;
+    pub fn run_steps(&mut self, mut steps: usize) -> Result<Option<u8>, Output> {
+        while self.pc < self.bf.len() && steps > 0 {
+            match self.tick() {
+                Ok(Some(byte)) => return Ok(Some(byte)),
+                Ok(None) => steps -= 1,
+                Err(e) => return Err(e),
+            }
         }
-        execute!(
-            terminal.backend_mut(),
-            EnterAlternateScreen,
-            DisableMouseCapture
-        )
-        .ok()?;
-
-        let result = self.debug_loop(&mut terminal);
-
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )
-        .ok()?;
-        if original_terminal_state.0 == false {
-            disable_raw_mode().ok()?;
+        if steps == 0 {
+            return Ok(None);
         }
-        if let Some(pos) = original_terminal_state.1 {
-            execute!(
-                terminal.backend_mut(),
-                crossterm::cursor::MoveTo(pos.0, pos.1)
-            )
-            .ok()?;
-        }
-
-        result
+        Err(Output::End)
     }
 
-    fn debug_loop(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Option<Output> {
-        let mut paused = true;
-        let mut last_tick = Instant::now();
-
-        loop {
-            if paused {
-                terminal
-                    .draw(|f| {
-                        let chunks = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints(
-                                [
-                                    Constraint::Percentage(10),
-                                    Constraint::Percentage(80),
-                                    Constraint::Percentage(10),
-                                ]
-                                .as_ref(),
-                            )
-                            .split(f.size());
-
-                        let memory_str = format!(
-                            "Memory: {:?}",
-                            &self.memory
-                                [self.position.saturating_sub(5)..self.position.saturating_add(5)]
-                        );
-                        let pc_str = format!("PC: {}", self.pc);
-                        let pos_str = format!("Position: {}", self.position);
-                        let instruction_str =
-                            format!("Instruction: {:?}", self.instructions.get(self.pc));
-
-                        let paragraph = Paragraph::new(format!(
-                            "{}\n{}\n{}\n{}",
-                            memory_str, pc_str, pos_str, instruction_str
-                        ))
-                        .block(Block::default().title("Debug").borders(Borders::ALL))
-                        .wrap(Wrap { trim: true });
-                        f.render_widget(paragraph, chunks[1]);
-
-                        let help_text =
-                            Paragraph::new("Press 'q' to quit, 'c' to continue, 's' to step")
-                                .block(Block::default().title("Help").borders(Borders::ALL));
-                        f.render_widget(help_text, chunks[0]);
-                    })
-                    .ok()?;
-
-                let timeout = Duration::from_millis(250);
-                if event::poll(timeout).ok()? {
-                    if let Event::Key(key) = event::read().ok()? {
-                        match key.code {
-                            KeyCode::Char('q') => return None,    // Exit debug mode
-                            KeyCode::Char('c') => paused = false, // Continue execution
-                            KeyCode::Char('s') => break,          // Step to the next instruction
-                            _ => {}
-                        }
-                    }
-                }
-            } else {
-                break;
-            }
-            if last_tick.elapsed() >= Duration::from_millis(250) {
-                last_tick = Instant::now();
-            }
+    pub fn tick(&mut self) -> Result<Option<u8>, Output> {
+        if self.pc >= self.bf.len() {
+            return Err(Output::End);
         }
 
-        // Execute a single instruction and return
-        if self.pc < self.instructions.len() {
-            #[cfg(not(feature = "debug"))]
-            {
-                if let Some(instruction) = self.instructions.get(self.pc).map(Clone::clone) {
-                    self.pc += 1;
-                    return instruction.execute(self);
-                } else {
-                    return Some(Output::End);
-                }
-            }
+        let command = self.bf[self.pc];
 
-            #[cfg(feature = "debug")]
-            {
-                if let Some(instruction) = self.instructions.get(self.pc).map(Clone::clone) {
-                    self.pc += 1;
-                    return instruction.0.execute(self);
-                } else {
-                    return Some(Output::End);
-                }
+        match command {
+            b'>' => self.move_right(),
+            b'<' => self.move_left(),
+            b'+' => self.add(),
+            b'-' => self.sub(),
+            b'.' => self.output(),
+            b',' => self.input(),
+            b'[' => self.jump_forward(),
+            b']' => self.jump_back(),
+            b'{' => self.comment(),
+            _ => Err(Output::UnallowedCharacter(self.pc)),
+        }
+    }
+
+    pub fn cell(&mut self, index: usize) -> &mut u8 {
+        if index >= self.tape.len() {
+            self.tape.resize(index + 100, 0);
+        }
+        &mut self.tape[index]
+    }
+
+    pub fn cells<T>(&self, indeces: T) -> &<Vec<u8> as Index<T>>::Output
+    where
+        Vec<u8>: Index<T>,
+    {
+        &self.tape[indeces]
+    }
+
+    fn move_right(&mut self) -> Result<Option<u8>, Output> {
+        self.pc += 1;
+        self.location += 1;
+        if self.keep_history {
+            self.history.push(Delta::Move(1));
+        }
+        Ok(None)
+    }
+
+    fn move_left(&mut self) -> Result<Option<u8>, Output> {
+        if self.location == 0 {
+            return Err(Output::TriedToMoveOutOfBounds);
+        }
+        self.pc += 1;
+        self.location -= 1;
+        if self.keep_history {
+            self.history.push(Delta::Move(-1));
+        }
+        Ok(None)
+    }
+
+    fn add(&mut self) -> Result<Option<u8>, Output> {
+        self.pc += 1;
+        *self.cell(self.location) = self.cell(self.location).wrapping_add(1);
+        if self.keep_history {
+            self.history.push(Delta::Add(1));
+        }
+        Ok(None)
+    }
+
+    fn sub(&mut self) -> Result<Option<u8>, Output> {
+        self.pc += 1;
+        *self.cell(self.location) = self.cell(self.location).wrapping_sub(1);
+        if self.keep_history {
+            self.history.push(Delta::Sub(1));
+        }
+        Ok(None)
+    }
+
+    fn output(&mut self) -> Result<Option<u8>, Output> {
+        self.pc += 1;
+        if self.keep_history {
+            self.history.push(Delta::Add(0));
+        }
+        Ok(Some(*self.cell(self.location)))
+    }
+
+    fn input(&mut self) -> Result<Option<u8>, Output> {
+        self.pc += 1;
+        if let Some(byte) = self.input.pop_front() {
+            *self.cell(self.location) = byte;
+            if self.keep_history {
+                self.history.push(Delta::Add(byte));
             }
+            Ok(None)
         } else {
-            Some(Output::End)
+            Err(Output::RequiresInput)
         }
+    }
+
+    /// if the current cell is 0, jump to the matching ]
+    fn jump_forward(&mut self) -> Result<Option<u8>, Output> {
+        if *self.cell(self.location) != 0 {
+            self.pc += 1;
+            return Ok(None);
+        }
+        if let Some(&jump) = self.cache.get(&self.pc) {
+            self.pc = jump;
+            if self.keep_history {
+                self.history.push(Delta::Jump(self.pc));
+            }
+            return Ok(None);
+        }
+        let mut depth = 1;
+        let jump = self.pc;
+        while depth > 0 {
+            self.pc += 1;
+            if self.pc >= self.bf.len() {
+                return Err(Output::TriedToMoveOutOfBounds);
+            }
+            match self.bf[self.pc] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+        }
+        self.pc += 1;
+        self.cache.insert(jump, self.pc);
+        if self.keep_history {
+            self.history.push(Delta::Jump(self.pc));
+        }
+        Ok(None)
+    }
+
+    fn jump_back(&mut self) -> Result<Option<u8>, Output> {
+        if *self.cell(self.location) == 0 {
+            self.pc += 1;
+            return Ok(None);
+        }
+        if let Some(&jump) = self.cache.get(&self.pc) {
+            self.pc = jump;
+            if self.keep_history {
+                self.history.push(Delta::Jump(self.pc));
+            }
+            return Ok(None);
+        }
+        let mut depth = 1;
+        let jump = self.pc;
+        while depth > 0 {
+            self.pc -= 1;
+            if self.pc == 0 {
+                return Err(Output::TriedToMoveOutOfBounds);
+            }
+            match self.bf[self.pc] {
+                b']' => depth += 1,
+                b'[' => depth -= 1,
+                _ => {}
+            }
+        }
+        self.cache.insert(jump, self.pc);
+        if self.keep_history {
+            self.history.push(Delta::Jump(self.pc));
+        }
+        Ok(None)
+    }
+
+    fn comment(&mut self) -> Result<Option<u8>, Output> {
+        if let Some(jump) = self.cache.get(&self.pc) {
+            self.pc = *jump;
+            return Ok(None);
+        }
+        let mut depth = 1;
+        let jump = self.pc;
+        while depth > 0 {
+            self.pc += 1;
+            if self.pc >= self.bf.len() {
+                return Err(Output::TriedToMoveOutOfBounds);
+            }
+            match self.bf[self.pc] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        self.pc += 1;
+        self.cache.insert(jump, self.pc);
+        if self.keep_history {
+            self.history.push(Delta::Jump(self.pc));
+        }
+        Ok(None)
+    }
+
+    pub fn load_input(&mut self, input: &[u8]) {
+        self.input.extend(input.iter());
+    }
+
+    pub fn take_output(&mut self, output: &mut [u8]) -> Result<usize, Output> {
+        for i in 0..output.len() {
+            match self.run() {
+                Ok(byte) => output[i] = byte,
+                Err(Output::End) => return Ok(i + 1),
+                Err(o) => return Err(o),
+            }
+        }
+        Ok(output.len())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn inc() {
+        let mut interpreter = Interpreter::new(b"+");
+        assert_eq!(interpreter.run(), Err(Output::End));
+        assert_eq!(interpreter.tape[0], 1);
+    }
+
+    #[test]
+    fn dec() {
+        let mut interpreter = Interpreter::new(b"-");
+        assert_eq!(interpreter.run(), Err(Output::End));
+        assert_eq!(interpreter.tape[0], 255);
+    }
+
+    #[test]
+    fn r#move() {
+        let mut interpreter = Interpreter::new(b">");
+        assert_eq!(interpreter.run(), Err(Output::End));
+        assert_eq!(interpreter.location, 1);
+    }
+
+    #[test]
+    fn move_back() {
+        let mut interpreter = Interpreter::new(b"><");
+        assert_eq!(interpreter.run(), Err(Output::End));
+        assert_eq!(interpreter.location, 0);
+    }
+
+    #[test]
+    fn output() {
+        let mut interpreter = Interpreter::new(b".");
+        interpreter.tape[0] = 65; // ASCII for 'A'
+        assert_eq!(interpreter.run(), Ok(65));
+    }
+
+    #[test]
+    fn input() {
+        let mut interpreter = Interpreter::new(b",");
+        interpreter.input.push_back(65); // ASCII for 'A'
+        assert_eq!(interpreter.run(), Err(Output::End));
+        assert_eq!(interpreter.tape[0], 65);
+    }
+
+    #[test]
+    fn jump_forward() {
+        let mut interpreter = Interpreter::new(b"[+]");
+        assert_eq!(interpreter.run_steps(100), Err(Output::End));
+        assert_eq!(interpreter.tape[0], 0);
+    }
+
+    #[test]
+    fn jump_back() {
+        let mut interpreter = Interpreter::new(b"+++++[-]");
+        assert_eq!(interpreter.run(), Err(Output::End));
+        assert_eq!(interpreter.tape[0], 0);
+    }
+
+    #[test]
+    fn move_out_of_bounds() {
+        let mut interpreter = Interpreter::new(b"<");
+        interpreter.location = 0;
+        assert_eq!(interpreter.move_left(), Err(Output::TriedToMoveOutOfBounds));
+    }
+
+    #[test]
+    fn unallowed_character() {
+        let mut interpreter = Interpreter::new(b"@");
+        assert_eq!(interpreter.run(), Err(Output::UnallowedCharacter(0)));
+    }
+
+    #[test]
+    fn comment() {
+        let mut interpreter = Interpreter::new(b"{+}");
+        assert_eq!(interpreter.run(), Err(Output::End));
+        assert_eq!(interpreter.tape[0], 0);
+    }
+
+    #[test]
+    fn hello_world() {
+        let mut interpreter = Interpreter::new(b"++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.");
+        let mut output = [0; 13];
+        assert_eq!(
+            interpreter.take_output(&mut output),
+            Ok(b"Hello World!\n".len())
+        );
+        assert_eq!(str::from_utf8(&output).unwrap(), "Hello World!\n");
     }
 }
